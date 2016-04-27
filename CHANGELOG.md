@@ -20,4 +20,5 @@
 
 # Internal Changes
 - Add a CHANGELOG file to track changes that are going into the upcoming release.
-
+- Switch all C shared utility tests to use umock_c in order to have the test code written in C rather than C++.
+- Remove obsolete unit test template from the tools folder.
