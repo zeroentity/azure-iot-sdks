@@ -145,6 +145,8 @@ IF(WIN32)
 ENDIF(WIN32)
 
 add_library(iothub_client 
+	${iothub_client_ll_transport_c_files} 
+	${iothub_client_ll_transport_h_files} 
 	${iothub_client_c_files} 
 	${iothub_client_h_files}
 )
