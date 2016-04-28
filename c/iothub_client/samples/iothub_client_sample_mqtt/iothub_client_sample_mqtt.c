@@ -15,7 +15,7 @@
 #include "certs.h"
 #endif // MBED_BUILD_TIMESTAMP
 
-static const char* connectionString = "HostName=iot-sdks-test.azure-devices.net;DeviceId=ForJelanisCode;SharedAccessKey=hjhZjLiXoB15I/lLMpogvIaKJH37isiSiudUJ8aZsk8=";
+static const char* connectionString = "[device connection string]";
 
 static int callbackCounter;
 static char msgText[1024];
