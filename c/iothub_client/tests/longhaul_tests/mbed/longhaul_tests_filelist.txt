@@ -1,0 +1,20 @@
+set(mbed_project_files
+		${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/*.c
+		${CMAKE_CURRENT_SOURCE_DIR}/*.h
+		${CMAKE_CURRENT_SOURCE_DIR}/../*.cpp 
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../../certs/certs.h
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../../certs/certs.c
+		${sdk_base_path}/c/testtools/iothub_test/src/*.c
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/testrunnerswitcher/src/*.c
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/micromock/src/*.c
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/ctest/src/*.c
+	)
+	
+set(mbed_exported_project_files
+		${sdk_base_path}/c/testtools/iothub_test/inc/*.h
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/testrunnerswitcher/inc/*.h
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/micromock/inc/*.h
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/ctest/inc/*.h
+		${sdk_base_path}/c/azure-c-shared-utility/testtools/sal/inc/*.h
+	)

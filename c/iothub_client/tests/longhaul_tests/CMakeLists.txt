@@ -8,7 +8,7 @@ if(NOT ${use_amqp})
 	message(FATAL_ERROR "longhaul_tests being generated without amqp support")
 endif()
 
-compileAsC99()
+compileAsC11()
 set(theseTestsName longhaul_tests)
 
 set(${theseTestsName}_cpp_files
@@ -32,8 +32,10 @@ if(WIN32)
 			iothub_test
 			iothub_client
 			iothub_client_amqp_transport
-			common
+			aziotsharedutil
+			rpcrt4
 		)
+		linkSharedUtil(${theseTestsName}_dll)
 		linkUAMQP(${theseTestsName}_dll)
 	endif()
 	
@@ -42,8 +44,10 @@ if(WIN32)
 			iothub_test
 			iothub_client
 			iothub_client_amqp_transport
-			common
+			aziotsharedutil
+			rpcrt4
 		)
+		linkSharedUtil(${theseTestsName}_exe)
 		linkUAMQP(${theseTestsName}_exe)
 	endif()
 else()
@@ -52,9 +56,10 @@ else()
 			iothub_test
 			iothub_client
 			iothub_client_amqp_transport
-			common
+			aziotsharedutil
 		)
-		target_link_libraries(${theseTestsName}_exe pthread)
+		target_link_libraries(${theseTestsName}_exe pthread uuid)
+		linkSharedUtil(${theseTestsName}_exe)
 		linkUAMQP(${theseTestsName}_exe)
 	endif()
 endif()

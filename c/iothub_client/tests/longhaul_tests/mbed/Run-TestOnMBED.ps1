@@ -29,45 +29,12 @@ $ReturnCodes = New-Enum @{
     "TestTimedOut" = 30;
 }
 
-
 $ReturnCode = $ReturnCodes.None;
 
-$IoTHubClientParams = @{
-    "IoTHubConnString?"               = $env:IOTHUB_CONNECTION_STRING;
-    "DeviceId?"                       = $env:IOTHUB_DEVICE_ID;
-    "DeviceKey?"                      = $env:IOTHUB_DEVICE_KEY;
-    "EventhubConsumerGroup?"          = $env:IOTHUB_EVENTHUB_CONSUMER_GROUP;
-    "EventhubListenName?"             = $env:IOTHUB_EVENTHUB_LISTEN_NAME;
-    "SharedAccessSignature?"          = $($env:IOTHUB_SHARED_ACCESS_SIGNATURE -REPLACE "SharedAccessSignature ", "");
-    
-    "IoTHubEventHubConnectionString?" = $env:IOTHUB_EVENTHUB_CONNECTION_STRING;
-    "IoTPartitionCount?"              = $env:IOTHUB_PARTITION_COUNT;
-    "EventHubConnectionString?"       = $env:IOTHUB_EVENTHUB_CONNECTION_STRING;
-    "EventHubName?"                   = $env:EVENTHUB_NAME;
-    "EventHubPartitionCount?"         = $env:EVENTHUB_PARTITION_COUNT
-}
 
-
-# Verifying expected parameters
+# Begin
 
 $ScriptState = $ScriptStates.Initializing;
-
-$AllExpectedVariablesSet = $true;
-foreach ($item in $IoTHubClientParams.Keys)
-{
-    if ($IoTHubClientParams[$item] -EQ $null)
-    {
-        Write-Message -Error "Could not find expected parameter [$item].";
-        $AllExpectedVariablesSet = $false;
-    }
-}
-
-if ($AllExpectedVariablesSet -EQ $false)
-{
-    Write-Message -Error "Not all the expected IoT Hub Client parameters are set on the environment variables. Please set them before running the tests.";
-
-    return $ReturnCodes.InvalidArgument;
-}
 
 
 # Loading dependency binaries
@@ -242,11 +209,21 @@ else
 					continue;
 				}
 				
-				if ($ScriptState -EQ $ScriptStates.ProvidingParameters -AND $IoTHubClientParams.Keys -IMATCH $Message)
+				if ($ScriptState -EQ $ScriptStates.ProvidingParameters)
 				{
-					Write-Message "Sending parameter [$($IoTHubClientParams[$Message])]";
-					$SerialPort.WriteLine($($IoTHubClientParams[$Message] -Replace " ", ""));
-					continue;
+					if (Test-Path "env:$Message")
+					{
+						Write-Message "Sending parameter [$Message]";
+						$SerialPort.WriteLine($((Get-ChildItem "env:$Message").Value -Replace " ", ""));
+					}
+					else
+					{
+						Write-Message -Error "The device requested the env var '$Message', but it is not set in the local host.";
+						$ReturnCode = $ReturnCodes.TestFailed;
+						$ScriptState = $ScriptStates.Terminating;
+					}
+
+					continue;					
 				}
 				
 				if ($Message -IMATCH "VerifyMessageReceived\[(.*)\] sent on \[(.*)\]")

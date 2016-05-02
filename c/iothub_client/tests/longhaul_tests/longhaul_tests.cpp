@@ -2,6 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <cstdlib>
+#include <climits>
 #ifdef _CRTDBG_MAP_ALLOC
 #include <crtdbg.h>
 #endif
@@ -9,7 +10,6 @@
 #include "testrunnerswitcher.h"
 #include "micromock.h"
 #include "micromockcharstararenullterminatedstrings.h"
-#include "azure_c_shared_utility/iot_logging.h"
 
 #include "iothub_client.h"
 #include "iothub_message.h"
@@ -20,6 +20,8 @@
 
 #include "azure_c_shared_utility/buffer_.h"
 #include "azure_c_shared_utility/threadapi.h"
+#include "azure_c_shared_utility/platform.h"
+#include "azure_c_shared_utility/iot_logging.h"
 
 #ifdef MBED_BUILD_TIMESTAMP
 #include "certs.h"
@@ -31,531 +33,412 @@ static bool g_callbackRecv = false;
 const char* TEST_EVENT_DATA_FMT = "{\"data\":\"%.24s\",\"id\":\"%d\"}";
 const char* TEST_MESSAGE_DATA_FMT = "{\"notifyData\":\"%.24s\",\"id\":\"%d\"}";
 
+static size_t g_iotHubTestId = 0;
+static IOTHUB_ACCOUNT_INFO_HANDLE g_iothubAcctInfo = NULL;
+
 #define IOTHUB_COUNTER_MAX           10
 #define IOTHUB_TIMEOUT_SEC           1000
-#define MAX_CLOUD_TRAVEL_TIME           60.0
-#define MAX_EVENT_RECEIVED_WAIT_TIME 180.0
-#define MAX_EVENT_RECEIVED_QUERY_TIME 10
-#define INDEFINITE_TIME ((time_t)-1)
-
+#define MAX_CLOUD_TRAVEL_TIME        60.0
 
 DEFINE_MICROMOCK_ENUM_TO_STRING(IOTHUB_TEST_CLIENT_RESULT, IOTHUB_TEST_CLIENT_RESULT_VALUES);
+DEFINE_MICROMOCK_ENUM_TO_STRING(IOTHUB_CLIENT_RESULT, IOTHUB_CLIENT_RESULT_VALUES);
+DEFINE_MICROMOCK_ENUM_TO_STRING(MAP_RESULT, MAP_RESULT_VALUES);
 
-#define IOTHUBCLIENT_TEST_CATEGORY_LONGHAUL "IOTHUBCLIENT_TESTS_LONGHAUL"
-
-#ifndef MBED_BUILD_TIMESTAMP
-DLIST_ENTRY eventsPendingVerification;
-LOCK_HANDLE eventsPendingVerificationLockHandle;
-IOTHUB_TEST_HANDLE devhubTestHandle;
-
-time_t receiveTimeQueryRangeStart = time(NULL);
-double minEventTravelTime = MAX_EVENT_RECEIVED_WAIT_TIME;
-double maxEventTravelTime = 0;
-double avgEventTravelTime = 0;
-double numberOfEventsSent = 0;
-double numberOfEventsReceived = 0;
-#endif
-
-typedef struct EVENT_DATA_TAG
+typedef struct EXPECTED_SEND_DATA_TAG
 {
-    int id;
-    const char* message;
-    bool sent;
-    bool received;
-    time_t time_sent;
-    time_t time_received;
-    DLIST_ENTRY link;
-} EVENT_DATA;
+	const char* expectedString;
+	bool wasFoundInHub;
+	bool dataWasSent;
+	time_t timeSent;
+	time_t timeReceived;
+	LOCK_HANDLE lock;
+} EXPECTED_SEND_DATA;
 
-typedef struct MESSAGE_DATA_TAG
-{
-    const char* toBeSend;
-    size_t toBeSendSize;
-    const char* data;
-    size_t dataSize;
-    bool received;
-} MESSAGE_DATA;
 
 BEGIN_TEST_SUITE(longhaul_tests)
 
-    static int IoTHubCallback(void* context, const char* data, size_t size)
-    {
-        int result = 1; // 0 means "keep processing"
-        
-#ifndef MBED_BUILD_TIMESTAMP
-        if (Lock(eventsPendingVerificationLockHandle) == LOCK_OK)
-        {
-            PDLIST_ENTRY currentListEntry = eventsPendingVerification.Flink;
+static int IoTHubCallback(void* context, const char* data, size_t size)
+{
+	size;
+	int result = 0; // 0 means "keep processing"
 
-            while (currentListEntry != &eventsPendingVerification)
-            {
-                result = 0;
+	EXPECTED_SEND_DATA* expectedData = (EXPECTED_SEND_DATA*)context;
+	if (expectedData != NULL)
+	{
+		if (Lock(expectedData->lock) != LOCK_OK)
+		{
+			ASSERT_FAIL("unable to lock");
+		}
+		else
+		{
+			if (
+				(strlen(expectedData->expectedString) == size) &&
+				(memcmp(expectedData->expectedString, data, size) == 0)
+				)
+			{
+				expectedData->wasFoundInHub = true;
+				expectedData->timeReceived = time(NULL);
+				result = 1;
+			}
+			(void)Unlock(expectedData->lock);
+		}
+	}
+	return result;
+}
 
-                EVENT_DATA* sentEvent = containingRecord(currentListEntry, EVENT_DATA, link);
+static void SendConfirmationCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* userContextCallback)
+{
+	result;
+	EXPECTED_SEND_DATA* expectedData = (EXPECTED_SEND_DATA*)userContextCallback;
+	if (expectedData != NULL)
+	{
+		if (Lock(expectedData->lock) != LOCK_OK)
+		{
+			ASSERT_FAIL("unable to lock");
+		}
+		else
+		{
+			expectedData->dataWasSent = true;
+			expectedData->timeSent = time(NULL);
+			(void)Unlock(expectedData->lock);
+		}
+	}
+}
 
-                if (strcmp(data, sentEvent->message) == 0)
-                {
-                    sentEvent->time_received = time(NULL);
-                    sentEvent->received = true;
+static EXPECTED_SEND_DATA* EventData_Create(void)
+{
+	EXPECTED_SEND_DATA* result = (EXPECTED_SEND_DATA*)malloc(sizeof(EXPECTED_SEND_DATA));
+	if (result != NULL)
+	{
+		if ((result->lock = Lock_Init()) == NULL)
+		{
+			ASSERT_FAIL("unable to Lock_Init");
+		}
+		else
+		{
+			char temp[1000];
+			char* tempString;
+			time_t t = time(NULL);
+			sprintf(temp, TEST_EVENT_DATA_FMT, ctime(&t), g_iotHubTestId);
+			if ((tempString = (char*)malloc(strlen(temp) + 1)) == NULL)
+			{
+				Lock_Deinit(result->lock);
+				free(result);
+				result = NULL;
+			}
+			else
+			{
+				strcpy(tempString, temp);
+				result->expectedString = tempString;
+				result->wasFoundInHub = false;
+				result->dataWasSent = false;
+				result->timeSent = 0;
+				result->timeReceived = 0;
+			}
+		}
+	}
+	return result;
+}
 
-                    numberOfEventsReceived++;
-                    break;
-                }
-                else
-                {
-                    currentListEntry = currentListEntry->Flink;
-                }
-            }
+static void EventData_Destroy(EXPECTED_SEND_DATA* data)
+{
+	if (data != NULL)
+	{
+		(void)Lock_Deinit(data->lock);
+		if (data->expectedString != NULL)
+		{
+			free((void*)data->expectedString);
+		}
+		free(data);
+	}
+}
 
-            Unlock(eventsPendingVerificationLockHandle);
-        }
-#endif
+typedef struct LONGHAUL_STATISTICS_TAG
+{
+	double numberOfEventsReceivedByHub;
+	double minEventTravelTime;
+	double maxEventTravelTime;
+	double avgEventTravelTime;
+} LONGHAUL_STATISTICS;
 
-        return result;
-    }
+static LONGHAUL_STATISTICS* initializeStatistics()
+{
+	LONGHAUL_STATISTICS* stats = (LONGHAUL_STATISTICS*)malloc(sizeof(LONGHAUL_STATISTICS));
 
-    static void SendEventCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* userContextCallback)
-    {
-        EVENT_DATA* data = (EVENT_DATA*)userContextCallback;
-        (void)result;
-        if (data != NULL)
-        {
-            data->time_sent = time(NULL);
-            data->sent = true;
+	if (stats != NULL)
+	{
+		stats->numberOfEventsReceivedByHub = 0;
+		stats->minEventTravelTime = LONG_MAX;
+		stats->maxEventTravelTime = 0;
+		stats->avgEventTravelTime = 0;
+	}
 
-#ifndef MBED_BUILD_TIMESTAMP
-            if (Lock(eventsPendingVerificationLockHandle) == LOCK_OK)
-            {
-                DList_AppendTailList(&eventsPendingVerification, &data->link);
+	return stats;
+}
 
-                numberOfEventsSent++;
+static void computeStatistics(LONGHAUL_STATISTICS* stats, EXPECTED_SEND_DATA* data)
+{
+	if (data->dataWasSent && data->wasFoundInHub)
+	{
+		double eventTravelTime = difftime(data->timeReceived, data->timeSent);
 
-                Unlock(eventsPendingVerificationLockHandle);
-            }
-#endif
-        }
-    }
+		if (eventTravelTime > stats->maxEventTravelTime)
+		{
+			stats->maxEventTravelTime = eventTravelTime;
+		}
 
-    static int ReceiveMessageCallback(IOTHUB_MESSAGE_HANDLE msg, void* userContextCallback)
-    {
-        MESSAGE_DATA* notifyData = (MESSAGE_DATA*)userContextCallback;
-        if (notifyData != NULL)
-        {
-            const char* buffer;
-            size_t size;
-            IoTHubMessage_GetByteArray(msg, (const unsigned char**)&buffer, &size);
+		if (eventTravelTime < stats->minEventTravelTime)
+		{
+			stats->minEventTravelTime = eventTravelTime;
+		}
 
-            if (notifyData->data == NULL)
-            {
-                if (buffer == NULL)
-                {
-                    if (size == 0)
-                    {
-                        notifyData->received = true;
-                    }
-                    else
-                    {
-                        notifyData->received = false;
-                    }
-                }
-                else
-                {
-                    notifyData->received = false;
-                }
-            }
-            else
-            {
-                if (buffer == NULL)
-                {
-                    notifyData->received = false;
-                }
-                else
-                {
-                    if (memcmp(notifyData->data, buffer, size) == 0)
-                    {
-                        notifyData->received = true;
-                    }
-                    else
-                    {
-                        notifyData->received = false;
-                    }
-                }
-            }
-        }
-        return 0;
-    }
+		stats->avgEventTravelTime = (stats->avgEventTravelTime * stats->numberOfEventsReceivedByHub + eventTravelTime) / (stats->numberOfEventsReceivedByHub + 1);
 
-    static MESSAGE_DATA* MessageData_Create(size_t dataId)
-    {
-        MESSAGE_DATA* result = (MESSAGE_DATA*)malloc(sizeof(MESSAGE_DATA));
-        if (result != NULL)
-        {
-            char temp[1000];
-            char* tempString;
-            time_t t = time(NULL);
-            sprintf(temp, TEST_MESSAGE_DATA_FMT, ctime(&t), dataId);
-            if ((tempString = (char*)malloc(strlen(temp) + 1)) == NULL)
-            {
-                free(result);
-                result = NULL;
-            }
-            else
-            {
-                strcpy(tempString, temp);
-                result->data = tempString;
-                result->dataSize = strlen(result->data);
-                result->received = false;
-                result->toBeSend = tempString;
-                result->toBeSendSize = strlen(result->toBeSend);
-            }
-        }
-        return result;
-    }
-    static MESSAGE_DATA* NullMessageData_Create(void)
-    {
-        MESSAGE_DATA* result = (MESSAGE_DATA*)malloc(sizeof(MESSAGE_DATA));
-        if (result != NULL)
-        {
-            result->data = NULL;
-            result->dataSize = 0;
-            result->received = false;
-            result->toBeSend = NULL;
-            result->toBeSendSize = 0;
-        }
-        return result;
-    }
+		stats->numberOfEventsReceivedByHub++;
+	}
+}
 
-    static void MessageData_Destroy(MESSAGE_DATA* data)
-    {
-        if (data != NULL)
-        {
-            if (data->data != NULL)
-            {
-                free((void*)data->data);
-            }
-        }
-        free(data);
-    }
+static void printStatistics(LONGHAUL_STATISTICS* stats)
+{
+	LogInfo("Number of Events: Sent=%f, Received=%f; Travel Time (secs): Min=%f, Max=%f, Average=%f",
+		stats->numberOfEventsReceivedByHub, stats->numberOfEventsReceivedByHub, stats->minEventTravelTime, stats->maxEventTravelTime, stats->avgEventTravelTime);
+}
 
-    static EVENT_DATA* EventData_CreateWithId(size_t dataId)
-    {
-        EVENT_DATA* result = (EVENT_DATA*)malloc(sizeof(EVENT_DATA));
-        if (result != NULL)
-        {
-            char temp[1000];
-            char* tempString;
-            time_t t = time(NULL);
-            sprintf(temp, TEST_EVENT_DATA_FMT, ctime(&t), dataId);
-            if ((tempString = (char*)malloc(strlen(temp) + 1)) == NULL)
-            {
-                free(result);
-                result = NULL;
-            }
-            else
-            {
-                result->id = dataId;
-                strcpy(tempString, temp);
-                result->message = tempString;
-                result->sent = false;
-                result->received = false;
-                result->time_sent = INDEFINITE_TIME;
-                result->time_received = INDEFINITE_TIME;
-                DList_InitializeListHead(&result->link);
-            }
-        }
+static void destroyStatistics(LONGHAUL_STATISTICS* stats)
+{
+	free(stats);
+}
 
-        return result;
-    }
+static int GetLonghaulTestDurationInSeconds(int defaultDurationInSeconds)
+{
+	int testDuration = 0;
 
-    static EVENT_DATA* EventData_Create()
-    {
-        return EventData_CreateWithId(clock());
-    }
+	char *envVar = getenv("IOTHUB_LONGHAUL_TEST_DURATION_IN_SECONDS");
 
-    static void EventData_Destroy(EVENT_DATA* data)
-    {
-        if (data != NULL)
-        {
-            if (data->message != NULL)
-            {
-                free((void*)data->message);
-            }
+	if (envVar != NULL)
+	{
+		testDuration = atoi(envVar);
+	}
 
-            free(data);
-        }
-    }
+	if (testDuration <= 0)
+	{
+		testDuration = defaultDurationInSeconds;
+	}
 
-    // Description:
-    //     This function blocks the current thread for the necessary ammount of time to complete 1 cycle of the expectedFrequencyInHz.
-    //     If (currentTimeInMilliseconds - initialTimeInMilliseconds) is longer than expectedFrequencyInHz, the function exits without blocking. 
-    // Parameters:
-    //     expectedFrequencyInHz: value (in Hertz, i.e. number of cycles per second) used to calculate the duration of 1 cycle of the expected frequency (min value = 1). 
-    //     initialTimeInMilliseconds: initial time of the cycle in milliseconds (as returned by 'clock() * 1000 / CLOCKS_PER_SEC').
-    // Returns:
-    //     Nothing.
-    static void WaitForFrequencyMatch(size_t expectedFrequencyInHz, size_t initialTimeInMilliseconds)
-    {
-        if (expectedFrequencyInHz == 0) expectedFrequencyInHz = 1;
+	return testDuration;
+}
 
-        size_t cycleExpectedTimeInMilliseconds = 1000 / expectedFrequencyInHz;
+// Description:
+//     This function blocks the current thread for the necessary ammount of time to complete 1 cycle of the expectedFrequencyInHz.
+//     If (currentTimeInMilliseconds - initialTimeInMilliseconds) is longer than expectedFrequencyInHz, the function exits without blocking. 
+// Parameters:
+//     expectedFrequencyInHz: value (in Hertz, i.e. number of cycles per second) used to calculate the duration of 1 cycle of the expected frequency (min value = 1). 
+//     initialTimeInMilliseconds: initial time of the cycle in milliseconds (as returned by 'clock() * 1000 / CLOCKS_PER_SEC').
+// Returns:
+//     Nothing.
+static void WaitForFrequencyMatch(size_t expectedFrequencyInHz, size_t initialTimeInMilliseconds)
+{
+	if (expectedFrequencyInHz == 0) expectedFrequencyInHz = 1;
 
-        size_t currentTimeInMilliseconds = (clock() * 1000) / CLOCKS_PER_SEC;
+	size_t cycleExpectedTimeInMilliseconds = 1000 / expectedFrequencyInHz;
 
-        if ((currentTimeInMilliseconds - initialTimeInMilliseconds) < cycleExpectedTimeInMilliseconds)
-        {
-            size_t cycleRemainingTimeInMilliseconds = cycleExpectedTimeInMilliseconds - (currentTimeInMilliseconds - initialTimeInMilliseconds);
+	size_t currentTimeInMilliseconds = (clock() * 1000) / CLOCKS_PER_SEC;
 
-            ThreadAPI_Sleep(cycleRemainingTimeInMilliseconds);
-        }
-    }
+	if ((currentTimeInMilliseconds - initialTimeInMilliseconds) < cycleExpectedTimeInMilliseconds)
+	{
+		size_t cycleRemainingTimeInMilliseconds = cycleExpectedTimeInMilliseconds - (currentTimeInMilliseconds - initialTimeInMilliseconds);
 
-    static int GetLonghaulTestDurationInSeconds(int defaultDurationInSeconds)
-    {
-        int testDuration = 0;
+		ThreadAPI_Sleep(cycleRemainingTimeInMilliseconds);
+	}
+}
 
-        char *envVar = getenv("IOTHUB_LONGHAUL_TEST_DURATION_IN_SECONDS");
-
-        if (envVar != NULL)
-        {
-            testDuration = atoi(envVar);
-        }
-
-        if (testDuration <= 0)
-        {
-            testDuration = defaultDurationInSeconds;
-        }
-
-        return testDuration;
-    }
-
-    static void InitializeEventReceivedVerification()
-    {
-#ifndef MBED_BUILD_TIMESTAMP
-
-        eventsPendingVerificationLockHandle = Lock_Init();
-        if (eventsPendingVerificationLockHandle == NULL)
-        {
-            LogError("Lock_Init failed for list of events pending verification.");
-        }
-
-        DList_InitializeListHead(&eventsPendingVerification);
-
-        devhubTestHandle = IoTHubTest_Initialize(IoTHubAccount_GetEventHubConnectionString(), IoTHubAccount_GetIoTHubConnString(), IoTHubAccount_GetDeviceId(), IoTHubAccount_GetDeviceKey(), IoTHubAccount_GetEventhubListenName(), IoTHubAccount_GetEventhubAccessKey(), IoTHubAccount_GetSharedAccessSignature(), IoTHubAccount_GetEventhubConsumerGroup());
-        ASSERT_IS_NOT_NULL(devhubTestHandle);
-#endif
-    }
-
-    static void VerifyEventsReceivedByHub(EVENT_DATA* sendData)
-    {
 #ifdef MBED_BUILD_TIMESTAMP
-        time_t time_sent = sendData->time_sent;
-        (void)LogInfo("VerifyMessageReceived[%s] sent on [%s]", sendData->message, ctime(&time_sent));
+static void verifyEventReceivedByHub(EXPECTED_SEND_DATA* sendData)
+{
+		(void)printf("VerifyMessageReceived[%s] sent on [%s]\r\n", sendData->expectedString, ctime(&sendData->timeSent));
 
-        int response = -1;
-        scanf("%d", &response);
+		int response = -1;
+		scanf("%d", &response);
 
-        if (response == 0 || response == 1)
-        {
-            sendData->received = response;
-            
-            if (response == 0)
-            {
-                ASSERT_FAIL("Event not received by IoT hub within expected time.\r\n");
-            }
-        }
-        else
-        {
-            LogError("Failed getting result of verification of Events received by hub.");
-        }
+		if (response == 0 || response == 1)
+		{
+			sendData->wasFoundInHub = response;
+
+			if (response == 0)
+			{
+				ASSERT_FAIL("Event not received by IoT hub within expected time.\r\n");
+			}
+		}
+		else
+		{
+			LogError("Failed getting result of verification of Events received by hub.");
+		}
+}
 #else
-        IOTHUB_TEST_CLIENT_RESULT clientResult = IoTHubTest_ListenForEvent(devhubTestHandle, IoTHubCallback, 16, NULL, receiveTimeQueryRangeStart, MAX_EVENT_RECEIVED_QUERY_TIME);
-        ASSERT_ARE_EQUAL(IOTHUB_TEST_CLIENT_RESULT, IOTHUB_TEST_CLIENT_OK, clientResult);
+static void verifyEventReceivedByHub(EXPECTED_SEND_DATA* sendData, IOTHUB_TEST_HANDLE iotHubTestHandle)
+{
+	IOTHUB_TEST_CLIENT_RESULT result = IoTHubTest_ListenForEventForMaxDrainTime(iotHubTestHandle, IoTHubCallback, IoTHubAccount_GetIoTHubPartitionCount(g_iothubAcctInfo), sendData);
+	ASSERT_ARE_EQUAL(IOTHUB_TEST_CLIENT_RESULT, IOTHUB_TEST_CLIENT_OK, result);
 
-
-        if (Lock(eventsPendingVerificationLockHandle) == LOCK_OK)
-        {
-            PDLIST_ENTRY currentListEntry = eventsPendingVerification.Flink;
-
-            receiveTimeQueryRangeStart = time(NULL);
-
-            while (currentListEntry != &eventsPendingVerification)
-            {
-                EVENT_DATA* sentEvent = containingRecord(currentListEntry, EVENT_DATA, link);
-
-                currentListEntry = currentListEntry->Flink;
-
-                if (sentEvent->received)
-                {
-                    double eventTravelTime = difftime(sentEvent->time_received, sentEvent->time_sent);
-
-                    if (eventTravelTime > maxEventTravelTime)
-                    {
-                        maxEventTravelTime = eventTravelTime;
-                    }
-
-                    if (eventTravelTime < minEventTravelTime)
-                    {
-                        minEventTravelTime = eventTravelTime;
-                    }
-
-                    if (numberOfEventsReceived > 0)
-                    {
-                        avgEventTravelTime = (avgEventTravelTime * (numberOfEventsReceived - 1) + eventTravelTime) / numberOfEventsReceived;
-                    }
-
-                    DList_RemoveEntryList(&sentEvent->link);
-                    EventData_Destroy(sentEvent);
-                }
-                else
-                {
-                    if (difftime(time(NULL), sentEvent->time_sent) > MAX_EVENT_RECEIVED_WAIT_TIME)
-                    {
-                        LogError("Event '%s' not received by IoT hub within %f seconds.", sentEvent->message, MAX_EVENT_RECEIVED_WAIT_TIME);
-
-                        ASSERT_FAIL("Event not received by IoT hub within expected time.\r\n");
-                    }
-                    
-                    if (difftime(receiveTimeQueryRangeStart, sentEvent->time_sent) > 0)
-                    {
-                        receiveTimeQueryRangeStart = sentEvent->time_sent + 325;
-                    }
-                }
-            }
-
-            Unlock(eventsPendingVerificationLockHandle);
-        }
+	// assert
+	ASSERT_IS_TRUE_WITH_MSG(sendData->wasFoundInHub, "Failure verifying if data was received by Event Hub.");
+}
 #endif
-    }
 
-    static void CompleteEventReceivedVerification()
-    {
+void RunLongHaulTest(int totalRunTimeInSeconds, int eventFrequencyInHz)
+{
+	LogInfo("Starting Long Haul tests (totalRunTimeInSeconds=%d, eventFrequencyInHz=%d)\r\n", totalRunTimeInSeconds, eventFrequencyInHz);
+
+	// arrange
+	IOTHUB_CLIENT_CONFIG iotHubConfig = { 0 };
+	IOTHUB_CLIENT_HANDLE iotHubClientHandle;
+	IOTHUB_CLIENT_RESULT result;
+
 #ifndef MBED_BUILD_TIMESTAMP
-        if (Lock(eventsPendingVerificationLockHandle) == LOCK_OK)
-        {
-            while (!DList_IsListEmpty(&eventsPendingVerification))
-            {
-                // The loop will terminate either if
-                // - all events were received by the hub (VerifyEventsReceivedByHub() will then empty eventsPendingVerification out), or
-                // - if VerifyEventsReceivedByHub triggers an assert for timing out the verification.
-                VerifyEventsReceivedByHub(NULL);
-            }
+	LONGHAUL_STATISTICS *stats;
 
-            IoTHubTest_Deinit(devhubTestHandle);
-
-            LogInfo("Number of Events: Sent=%f, Received=%f; Travel Time (secs): Min=%f, Max=%f, Average=%f", 
-                numberOfEventsSent, numberOfEventsReceived, minEventTravelTime, maxEventTravelTime, avgEventTravelTime);
-
-            Unlock(eventsPendingVerificationLockHandle);
-        }
-
-        Lock_Deinit(eventsPendingVerificationLockHandle);
+	stats = initializeStatistics();
+	ASSERT_IS_NOT_NULL_WITH_MSG(stats, "Failed creating the container to track statistics.");
 #endif
-    }
 
-    void RunLongHaulTest(int totalRunTimeInSeconds, int eventFrequencyInHz)
-    {
-        LogInfo("Starting Long Haul tests (totalRunTimeInSeconds=%d, eventFrequencyInHz=%d)", totalRunTimeInSeconds, eventFrequencyInHz);
+	iotHubConfig.iotHubName = IoTHubAccount_GetIoTHubName(g_iothubAcctInfo);
+	iotHubConfig.iotHubSuffix = IoTHubAccount_GetIoTHubSuffix(g_iothubAcctInfo);
+	iotHubConfig.deviceId = IoTHubAccount_GetDeviceId(g_iothubAcctInfo);
+	iotHubConfig.deviceKey = IoTHubAccount_GetDeviceKey(g_iothubAcctInfo);
+	iotHubConfig.protocol = AMQP_Protocol;
 
-        // arrange
-        IOTHUB_CLIENT_CONFIG iotHubConfig;
-        IOTHUB_CLIENT_HANDLE iotHubClientHandle;
+	// Create the IoT Hub Data
+#ifndef MBED_BUILD_TIMESTAMP
+	IOTHUB_TEST_HANDLE iotHubTestHandle = IoTHubTest_Initialize(IoTHubAccount_GetEventHubConnectionString(g_iothubAcctInfo), IoTHubAccount_GetIoTHubConnString(g_iothubAcctInfo), IoTHubAccount_GetDeviceId(g_iothubAcctInfo), IoTHubAccount_GetDeviceKey(g_iothubAcctInfo), IoTHubAccount_GetEventhubListenName(g_iothubAcctInfo), IoTHubAccount_GetEventhubAccessKey(g_iothubAcctInfo), IoTHubAccount_GetSharedAccessSignature(g_iothubAcctInfo), IoTHubAccount_GetEventhubConsumerGroup(g_iothubAcctInfo));
+	ASSERT_IS_NOT_NULL_WITH_MSG(iotHubTestHandle, "Failed initializing the Event Hub listener.");
+#endif
 
-        iotHubConfig.iotHubName = IoTHubAccount_GetIoTHubName();
-        iotHubConfig.iotHubSuffix = IoTHubAccount_GetIoTHubSuffix();
-        iotHubConfig.deviceId = IoTHubAccount_GetDeviceId();
-        iotHubConfig.deviceKey = IoTHubAccount_GetDeviceKey();
-        iotHubConfig.protocol = AMQP_Protocol;
+	iotHubClientHandle = IoTHubClient_Create(&iotHubConfig);
+	ASSERT_IS_NOT_NULL_WITH_MSG(iotHubClientHandle, "Failed creating the IoT Hub Client.");
 
-        InitializeEventReceivedVerification();
-
-        iotHubClientHandle = IoTHubClient_Create(&iotHubConfig);
-        ASSERT_IS_NOT_NULL(iotHubClientHandle);
-        
 #ifdef MBED_BUILD_TIMESTAMP
-        // For mbed add the certificate information
-        if (IoTHubClient_SetOption(iotHubClientHandle, "TrustedCerts", certificates) != IOTHUB_CLIENT_OK)
-        {
-            LogError("failure to set option \"TrustedCerts\"");
-        }
+	result = IoTHubClient_SetOption(iotHubClientHandle, "TrustedCerts", certificates);
+	ASSERT_ARE_EQUAL_WITH_MSG(int, IOTHUB_CLIENT_OK, result, "Failed setting certificates on IoT Hub client.");
 #endif
 
-        time_t testInitialTime = time(NULL);
+	time_t testInitialTime = time(NULL);
 
-        // act
-        while (difftime(time(NULL), testInitialTime) <= totalRunTimeInSeconds)
-        {
-            // arrange
-            size_t loopInitialTimeInMilliseconds;
-            EVENT_DATA* sendData;
-            IOTHUB_MESSAGE_HANDLE msgHandle;
-            IOTHUB_CLIENT_RESULT dhresult;
-            time_t initialTime;
+	while (difftime(time(NULL), testInitialTime) <= totalRunTimeInSeconds)
+	{
+		size_t loopInitialTimeInMilliseconds;
+		EXPECTED_SEND_DATA* sendData;
+		IOTHUB_MESSAGE_HANDLE msgHandle;
 
-            loopInitialTimeInMilliseconds = (clock() * 1000) / CLOCKS_PER_SEC;
+		loopInitialTimeInMilliseconds = (clock() * 1000) / CLOCKS_PER_SEC;
 
-            sendData = EventData_Create();
-            ASSERT_IS_NOT_NULL(sendData);
+		sendData = EventData_Create();
+		ASSERT_IS_NOT_NULL_WITH_MSG(sendData, "Failed creating EXPECTED_SEND_DATA.");
 
-            msgHandle = IoTHubMessage_CreateFromByteArray((const unsigned char*)sendData->message, strlen(sendData->message));
-            ASSERT_IS_NOT_NULL(msgHandle);
+		// act
+		msgHandle = IoTHubMessage_CreateFromByteArray((const unsigned char*)sendData->expectedString, strlen(sendData->expectedString));
+		ASSERT_IS_NOT_NULL_WITH_MSG(msgHandle, "Failed creating IOTHUB_MESSAGE_HANDLE.");
 
-            // act
-            dhresult = IoTHubClient_SendEventAsync(iotHubClientHandle, msgHandle, SendEventCallback, sendData);
-            ASSERT_ARE_EQUAL(int, IOTHUB_CLIENT_OK, dhresult);
+		// act
+		result = IoTHubClient_SendEventAsync(iotHubClientHandle, msgHandle, SendConfirmationCallback, sendData);
+		ASSERT_ARE_EQUAL_WITH_MSG(int, IOTHUB_CLIENT_OK, result, "Call to IoTHubClient_SendEventAsync failed.");
 
-            initialTime = time(NULL);
+		time_t beginOperation, nowTime;
+		beginOperation = time(NULL);
+		while (
+			(nowTime = time(NULL)),
+			(difftime(nowTime, beginOperation) < MAX_CLOUD_TRAVEL_TIME) // time box
+			)
+		{
+			if (Lock(sendData->lock) != LOCK_OK)
+			{
+				ASSERT_FAIL("unable to lock");
+			}
+			else
+			{
+				if (sendData->dataWasSent)
+				{
+					Unlock(sendData->lock);
+					break;
+				}
+				Unlock(sendData->lock);
+			}
+			ThreadAPI_Sleep(100);
+		}
 
-            while ((difftime(time(NULL), initialTime) < MAX_CLOUD_TRAVEL_TIME) && (!sendData->sent))
-            {
-                // Just go on here
-            }
+		if (Lock(sendData->lock) != LOCK_OK)
+		{
+			ASSERT_FAIL("unable to lock");
+		}
+		else
+		{
+			ASSERT_IS_TRUE_WITH_MSG(sendData->dataWasSent, "Failure sending data to IotHub");
+			(void)Unlock(sendData->lock);
+		}
 
-            // assert
-            ASSERT_IS_TRUE(sendData->sent); // Callback was invoked (event was sent by IoTHubClient).
+#ifdef MBED_BUILD_TIMESTAMP
+		verifyEventReceivedByHub(sendData);
+#else
+		verifyEventReceivedByHub(sendData, iotHubTestHandle);
+		computeStatistics(stats, sendData);
+#endif
 
-            VerifyEventsReceivedByHub(sendData);
+		IoTHubMessage_Destroy(msgHandle);
+		EventData_Destroy(sendData);
 
-            IoTHubMessage_Destroy(msgHandle);
+		WaitForFrequencyMatch(eventFrequencyInHz, loopInitialTimeInMilliseconds);
+	}
 
-            WaitForFrequencyMatch(eventFrequencyInHz, loopInitialTimeInMilliseconds);
-        }
+	// cleanup
+	IoTHubClient_Destroy(iotHubClientHandle);
 
-        LogInfo("1 tests ran, 0 failed, 1 succeeded.");
+#ifndef MBED_BUILD_TIMESTAMP
+	IoTHubTest_Deinit(iotHubTestHandle);
+	
+	printStatistics(stats);
+	destroyStatistics(stats);
+#endif
 
-        // cleanup
-        IoTHubClient_Destroy(iotHubClientHandle);
+	LogInfo("Long Haul tests completed\r\n");
+}
 
-        CompleteEventReceivedVerification();
 
-        LogInfo("Long Haul tests completed");
-    }
+TEST_SUITE_INITIALIZE(TestClassInitialize)
+{
+	ASSERT_ARE_EQUAL(int, 0, platform_init());
+	INITIALIZE_MEMORY_DEBUG(g_dllByDll);
+	platform_init();
+	g_iothubAcctInfo = IoTHubAccount_Init(true, "longhaul_tests");
+	ASSERT_IS_NOT_NULL(g_iothubAcctInfo);
+	platform_init();
+}
 
-    TEST_SUITE_INITIALIZE(TestClassInitialize)
-    {
-        TEST_INITIALIZE_MEMORY_DEBUG(g_dllByDll);
-    }
+TEST_SUITE_CLEANUP(TestClassCleanup)
+{
+	IoTHubAccount_deinit(g_iothubAcctInfo);
+	// Need a double deinit
+	platform_deinit();
+	DEINITIALIZE_MEMORY_DEBUG(g_dllByDll);
+	platform_deinit();
+}
 
-    TEST_SUITE_CLEANUP(TestClassCleanup)
-    {
-        TEST_DEINITIALIZE_MEMORY_DEBUG(g_dllByDll);
-    }
+TEST_FUNCTION_INITIALIZE(TestMethodInitialize)
+{
+	g_iotHubTestId++;
+}
 
-    TEST_FUNCTION_INITIALIZE(TestMethodInitialize)
-    {
-    }
+TEST_FUNCTION_CLEANUP(TestMethodCleanup)
+{
+}
 
-    TEST_FUNCTION_CLEANUP(TestMethodCleanup)
-    {
-    }
+TEST_FUNCTION(IoTHubClient_LongHaul_12h_Run_1_Event_Per_Sec)
+{
+	const int TEST_MAX_TIME_IN_SECONDS = 12 * 60 * 60;
+	const int EVENT_FREQUENCY_IN_HZ = 1;
 
-    TEST_FUNCTION(IoTHubClient_LongHaul_12h_Run_1_Event_Per_Sec)
-    {
-        const int TEST_MAX_TIME_IN_SECONDS = 12 * 60 * 60;
-        const int EVENT_FREQUENCY_IN_HZ = 1;
-
-        int testDuration = GetLonghaulTestDurationInSeconds(TEST_MAX_TIME_IN_SECONDS);
-
-        RunLongHaulTest(testDuration, EVENT_FREQUENCY_IN_HZ);
-    }
+	int testDuration = GetLonghaulTestDurationInSeconds(TEST_MAX_TIME_IN_SECONDS);
+	
+	RunLongHaulTest(testDuration, EVENT_FREQUENCY_IN_HZ);
+}
 
 END_TEST_SUITE(longhaul_tests)
+
