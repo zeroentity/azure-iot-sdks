@@ -26,6 +26,7 @@ namespace Microsoft.Azure.Devices.Client
 #else
     using AsyncTask = System.Threading.Tasks.Task;
     using AsyncTaskOfMessage = System.Threading.Tasks.Task<Message>;
+    using System.IO;
 #endif
 
     /// <summary>
@@ -613,7 +614,7 @@ namespace Microsoft.Azure.Devices.Client
                 this.ThrowIfDisposed();
                 return this.impl.SendEventAsync(message).AsTaskOrAsyncOp();
 #if !PCL
-        }
+            }
 #endif
         }
 
@@ -638,6 +639,28 @@ namespace Microsoft.Azure.Devices.Client
 #endif
                 this.ThrowIfDisposed();
                 return this.impl.SendEventBatchAsync(messages).AsTaskOrAsyncOp();
+#if !PCL
+            }
+#endif
+        }
+
+        public AsyncTask UploadToBlobAsync(String blobName, Stream source)
+        {
+#if !PCL
+            if (this.impl == null)
+            {
+                return Task.Run(async () =>
+                {
+                    await this.EnsureOpenedAsync();
+
+                    await this.impl.SendEventAsync(message);
+                }).AsTaskOrAsyncOp();
+            }
+            else
+            {
+#endif
+                this.ThrowIfDisposed();
+                return this.impl.SendEventAsync(message).AsTaskOrAsyncOp();
 #if !PCL
             }
 #endif
